@@ -31,7 +31,7 @@ export default function Navbar() {
     <nav className="bg-white border-b shadow-sm">
       <div className="max-w-5xl mx-auto px-4 h-14 flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <span className="font-bold text-indigo-600 text-lg mr-4">Timesheet</span>
+          <span className="font-bold text-indigo-600 text-lg mr-4">RQSO Limited</span>
           {user?.role === 'employee' && (
             <>
               <NavItem to="/timesheet">My Timesheet</NavItem>

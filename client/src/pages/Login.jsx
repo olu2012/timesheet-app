@@ -28,8 +28,8 @@ export default function Login() {
     <div className="min-h-screen bg-gradient-to-br from-indigo-50 to-white flex items-center justify-center p-4">
       <div className="bg-white rounded-2xl shadow-lg p-8 w-full max-w-sm">
         <div className="text-center mb-8">
-          <h1 className="text-2xl font-bold text-indigo-600">Timesheet App</h1>
-          <p className="text-gray-500 text-sm mt-1">Sign in to your account</p>
+          <h1 className="text-2xl font-bold text-indigo-600">RQSO Limited</h1>
+          <p className="text-gray-500 text-sm mt-1">Employee Timesheet Portal</p>
         </div>
 
         {error && (
