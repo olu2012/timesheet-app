@@ -195,4 +195,39 @@ router.post('/users', async (req, res, next) => {
   }
 });
 
+// PUT /api/admin/users/:id — update name and/or password
+router.put('/users/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { name, password } = req.body;
+
+    if (!name && !password) {
+      return res.status(400).json({ error: 'Provide a new name or password to update' });
+    }
+    if (name && name.trim().length === 0) {
+      return res.status(400).json({ error: 'Name cannot be blank' });
+    }
+    if (password && password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    const { rows: existing } = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
+    if (!existing[0]) return res.status(404).json({ error: 'User not found' });
+
+    const updatedName = name ? name.trim() : existing[0].name;
+    const updatedHash = password ? await bcrypt.hash(password, 10) : existing[0].password_hash;
+
+    const { rows } = await pool.query(
+      `UPDATE users SET name = $1, password_hash = $2
+       WHERE id = $3
+       RETURNING id, name, email, role, department, created_at`,
+      [updatedName, updatedHash, id]
+    );
+
+    res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
 module.exports = router;
