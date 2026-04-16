@@ -1,4 +1,5 @@
 const express = require('express');
+const bcrypt = require('bcrypt');
 const pool = require('../db/pool');
 const { authenticate, requireAdmin } = require('../middleware/auth');
 const { sendApprovalEmail, sendRejectionEmail } = require('../services/email');
@@ -143,18 +144,52 @@ router.get('/employees', async (req, res, next) => {
   try {
     const { rows } = await pool.query(
       `SELECT
-         u.id, u.name, u.email, u.department, u.created_at,
+         u.id, u.name, u.email, u.role, u.department, u.created_at,
          COUNT(t.id)                                              AS total_timesheets,
          COUNT(t.id) FILTER (WHERE t.status = 'submitted')       AS pending,
          COUNT(t.id) FILTER (WHERE t.status = 'approved')        AS approved,
          COUNT(t.id) FILTER (WHERE t.status = 'rejected')        AS rejected
        FROM users u
        LEFT JOIN timesheets t ON t.user_id = u.id
-       WHERE u.role = 'employee'
+       WHERE u.role IN ('employee', 'admin')
        GROUP BY u.id
        ORDER BY u.name`
     );
     res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/admin/users — create a new user
+router.post('/users', async (req, res, next) => {
+  try {
+    const { name, email, password, role, department } = req.body;
+
+    if (!name || !email || !password) {
+      return res.status(400).json({ error: 'Name, email and password are required' });
+    }
+    if (!['employee', 'admin'].includes(role)) {
+      return res.status(400).json({ error: 'Role must be employee or admin' });
+    }
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase().trim()]);
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: 'A user with this email already exists' });
+    }
+
+    const hash = await bcrypt.hash(password, 10);
+    const { rows } = await pool.query(
+      `INSERT INTO users (name, email, password_hash, role, department)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, name, email, role, department, created_at`,
+      [name.trim(), email.toLowerCase().trim(), hash, role, department?.trim() || null]
+    );
+
+    res.status(201).json(rows[0]);
   } catch (err) {
     next(err);
   }
