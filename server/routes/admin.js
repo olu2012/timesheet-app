@@ -299,12 +299,14 @@ router.get('/employees', async (req, res, next) => {
       `SELECT
          u.id, u.name, u.email, u.role, u.department, u.created_at,
          u.overtime_threshold_hours,
-         COUNT(t.id)                                              AS total_timesheets,
-         COUNT(t.id) FILTER (WHERE t.status = 'submitted')       AS pending,
-         COUNT(t.id) FILTER (WHERE t.status = 'approved')        AS approved,
-         COUNT(t.id) FILTER (WHERE t.status = 'rejected')        AS rejected
+         COUNT(DISTINCT t.id)                                              AS total_timesheets,
+         COUNT(DISTINCT t.id) FILTER (WHERE t.status = 'submitted')       AS pending,
+         COUNT(DISTINCT t.id) FILTER (WHERE t.status = 'approved')        AS approved,
+         COUNT(DISTINCT t.id) FILTER (WHERE t.status = 'rejected')        AS rejected,
+         COALESCE(SUM(te.hours) FILTER (WHERE t.status = 'approved'), 0)  AS total_approved_hours
        FROM users u
        LEFT JOIN timesheets t ON t.user_id = u.id
+       LEFT JOIN timesheet_entries te ON te.timesheet_id = t.id
        WHERE u.role IN ('employee', 'admin')
        GROUP BY u.id
        ORDER BY u.name`

@@ -279,7 +279,7 @@ export default function AdminEmployees() {
         <table className="w-full text-sm">
           <thead className="bg-gray-50 border-b">
             <tr>
-              {['Name', 'Email', 'Department', 'Role', 'Total', 'Pending', 'Approved', 'Rejected', 'Joined', ''].map((h) => (
+              {['Name', 'Email', 'Department', 'Role', 'Approved Hrs', 'Timesheets', 'Pending', 'Approved', 'Rejected', 'Joined', ''].map((h) => (
                 <th key={h} className="text-left px-4 py-3 font-medium text-gray-500 whitespace-nowrap">
                   {h}
                 </th>
@@ -295,6 +295,11 @@ export default function AdminEmployees() {
                 <td className="px-4 py-3">
                   <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-600 capitalize">
                     {emp.role || 'employee'}
+                  </span>
+                </td>
+                <td className="px-4 py-3 text-center">
+                  <span className="font-semibold text-indigo-700">
+                    {parseFloat(emp.total_approved_hours || 0).toFixed(1)}
                   </span>
                 </td>
                 <td className="px-4 py-3 text-center text-gray-600">{emp.total_timesheets}</td>
