@@ -116,6 +116,7 @@ export default function Navbar() {
               <NavDropdown
                 label="Reports"
                 items={[
+                  { to: '/admin/reports/weekly-hours', label: 'Weekly Hours' },
                   { to: '/admin/reports/department-totals', label: 'Department Totals' },
                   { to: '/admin/reports/overtime', label: 'Overtime Report' },
                   { to: '/admin/reports/export', label: 'Export CSV' },

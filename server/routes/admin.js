@@ -404,6 +404,38 @@ router.post('/reminders/remind-all', async (req, res, next) => {
   }
 });
 
+// ─── GET /api/admin/reports/weekly-hours ────────────────────────────────────
+router.get('/reports/weekly-hours', async (req, res, next) => {
+  try {
+    const weekStart = req.query.weekStart || getMondayOfCurrentWeek();
+    const { rows } = await pool.query(
+      `SELECT
+         u.id, u.name,
+         COALESCE(u.department, '—') AS department,
+         t.status,
+         MAX(CASE WHEN te.day_of_week = 'mon' THEN COALESCE(te.amended_hours, te.hours) END) AS mon,
+         MAX(CASE WHEN te.day_of_week = 'tue' THEN COALESCE(te.amended_hours, te.hours) END) AS tue,
+         MAX(CASE WHEN te.day_of_week = 'wed' THEN COALESCE(te.amended_hours, te.hours) END) AS wed,
+         MAX(CASE WHEN te.day_of_week = 'thu' THEN COALESCE(te.amended_hours, te.hours) END) AS thu,
+         MAX(CASE WHEN te.day_of_week = 'fri' THEN COALESCE(te.amended_hours, te.hours) END) AS fri,
+         MAX(CASE WHEN te.day_of_week = 'sat' THEN COALESCE(te.amended_hours, te.hours) END) AS sat,
+         MAX(CASE WHEN te.day_of_week = 'sun' THEN COALESCE(te.amended_hours, te.hours) END) AS sun,
+         COALESCE(SUM(COALESCE(te.amended_hours, te.hours)), 0) AS total_hours
+       FROM users u
+       LEFT JOIN timesheets t
+         ON t.user_id = u.id AND t.week_start_date = $1::DATE
+       LEFT JOIN timesheet_entries te ON te.timesheet_id = t.id
+       WHERE u.role = 'employee'
+       GROUP BY u.id, u.name, u.department, t.status
+       ORDER BY u.name`,
+      [weekStart]
+    );
+    res.json({ weekStart, employees: rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ─── GET /api/admin/reports/department-totals ───────────────────────────────
 router.get('/reports/department-totals', async (req, res, next) => {
   try {
