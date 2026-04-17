@@ -2,6 +2,7 @@ const express = require('express');
 const pool = require('../db/pool');
 const { authenticate } = require('../middleware/auth');
 const { sendAdminSubmitEmail } = require('../services/email');
+const { recalcOvertimeFlag } = require('../db/helpers');
 
 const router = express.Router();
 
@@ -117,6 +118,10 @@ router.put('/:id', async (req, res, next) => {
       }
     }
 
+    if (Array.isArray(entries) && entries.length > 0) {
+      await recalcOvertimeFlag(id);
+    }
+
     const updated = await pool.query('SELECT * FROM timesheets WHERE id = $1', [id]);
     const updatedEntries = await pool.query(
       `SELECT * FROM timesheet_entries WHERE timesheet_id = $1
@@ -151,12 +156,7 @@ router.post('/:id/submit', async (req, res, next) => {
       [id]
     );
 
-    // Calculate total hours for notification
-    const { rows: entries } = await pool.query(
-      'SELECT hours FROM timesheet_entries WHERE timesheet_id = $1',
-      [id]
-    );
-    const totalHours = entries.reduce((s, e) => s + parseFloat(e.hours), 0);
+    const { total: totalHours } = await recalcOvertimeFlag(id);
 
     // Notify all admins (fire-and-forget — email failures don't block the response)
     const { rows: admins } = await pool.query("SELECT email FROM users WHERE role = 'admin'");

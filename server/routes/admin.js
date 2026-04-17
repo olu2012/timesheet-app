@@ -2,10 +2,11 @@ const express = require('express');
 const bcrypt = require('bcrypt');
 const pool = require('../db/pool');
 const { authenticate, requireAdmin } = require('../middleware/auth');
-const { sendApprovalEmail, sendRejectionEmail } = require('../services/email');
+const { sendApprovalEmail, sendRejectionEmail, sendReminderEmail, sendAmendmentEmail } = require('../services/email');
+const { getMondayOfCurrentWeek, createAuditLog } = require('../db/helpers');
+const { runRemindAll, runWeeklySummary } = require('../services/cron');
 
 const router = express.Router();
-
 router.use(authenticate, requireAdmin);
 
 const ENTRY_ORDER = `CASE te.day_of_week
@@ -13,26 +14,49 @@ const ENTRY_ORDER = `CASE te.day_of_week
   WHEN 'thu' THEN 4 WHEN 'fri' THEN 5 WHEN 'sat' THEN 6 WHEN 'sun' THEN 7
 END`;
 
-// GET /api/admin/timesheets?status=submitted
+const DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+
+function csvEscape(val) {
+  const str = String(val ?? '');
+  if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+// ─── GET /api/admin/timesheets ──────────────────────────────────────────────
 router.get('/timesheets', async (req, res, next) => {
   try {
-    const { status } = req.query;
+    const { status, employeeId } = req.query;
     const params = [];
-    let where = '';
-    if (status) {
+    const conditions = [];
+
+    if (status === 'overtime') {
+      conditions.push('t.is_overtime_flagged = true');
+    } else if (status) {
       params.push(status);
-      where = 'WHERE t.status = $1';
+      conditions.push(`t.status = $${params.length}`);
     }
+    if (employeeId) {
+      params.push(employeeId);
+      conditions.push(`t.user_id = $${params.length}`);
+    }
+    const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
 
     const { rows } = await pool.query(
       `SELECT t.*,
          u.name        AS employee_name,
          u.email       AS employee_email,
          u.department,
+         u.overtime_threshold_hours,
          COALESCE(
            json_agg(
-             json_build_object('id', te.id, 'day_of_week', te.day_of_week, 'hours', te.hours)
-             ORDER BY ${ENTRY_ORDER}
+             json_build_object(
+               'id', te.id,
+               'day_of_week', te.day_of_week,
+               'hours', te.hours,
+               'amended_hours', te.amended_hours
+             ) ORDER BY ${ENTRY_ORDER}
            ) FILTER (WHERE te.id IS NOT NULL),
            '[]'::json
          ) AS entries
@@ -40,7 +64,7 @@ router.get('/timesheets', async (req, res, next) => {
        JOIN users u ON u.id = t.user_id
        LEFT JOIN timesheet_entries te ON te.timesheet_id = t.id
        ${where}
-       GROUP BY t.id, u.name, u.email, u.department
+       GROUP BY t.id, u.name, u.email, u.department, u.overtime_threshold_hours
        ORDER BY t.updated_at DESC`,
       params
     );
@@ -50,13 +74,51 @@ router.get('/timesheets', async (req, res, next) => {
   }
 });
 
-// GET /api/admin/timesheets/:id
+// ─── POST /api/admin/timesheets/bulk-approve ────────────────────────────────
+router.post('/timesheets/bulk-approve', async (req, res, next) => {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: 'ids must be a non-empty array' });
+    }
+
+    const succeeded = [];
+    const failed = [];
+
+    for (const id of ids) {
+      try {
+        const { rows: tsRows } = await pool.query(
+          `SELECT t.*, u.email, u.name FROM timesheets t JOIN users u ON u.id = t.user_id WHERE t.id = $1`,
+          [id]
+        );
+        const ts = tsRows[0];
+        if (!ts) { failed.push({ id, reason: 'Not found' }); continue; }
+        if (ts.status !== 'submitted') { failed.push({ id, reason: 'Not submitted' }); continue; }
+
+        await pool.query(
+          `UPDATE timesheets SET status = 'approved', reviewed_at = NOW(), updated_at = NOW() WHERE id = $1`,
+          [id]
+        );
+        await createAuditLog({ timesheetId: id, action: 'approved', performedBy: req.user.id });
+        sendApprovalEmail(ts.email, { employeeName: ts.name, weekStart: ts.week_start_date }).catch(console.error);
+        succeeded.push(id);
+      } catch (err) {
+        failed.push({ id, reason: err.message });
+      }
+    }
+
+    res.json({ succeeded, failed });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── GET /api/admin/timesheets/:id ─────────────────────────────────────────
 router.get('/timesheets/:id', async (req, res, next) => {
   try {
     const { rows } = await pool.query(
-      `SELECT t.*, u.name AS employee_name, u.email AS employee_email, u.department
-       FROM timesheets t JOIN users u ON u.id = t.user_id
-       WHERE t.id = $1`,
+      `SELECT t.*, u.name AS employee_name, u.email AS employee_email, u.department, u.overtime_threshold_hours
+       FROM timesheets t JOIN users u ON u.id = t.user_id WHERE t.id = $1`,
       [req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Timesheet not found' });
@@ -71,14 +133,12 @@ router.get('/timesheets/:id', async (req, res, next) => {
   }
 });
 
-// POST /api/admin/timesheets/:id/approve
+// ─── POST /api/admin/timesheets/:id/approve ─────────────────────────────────
 router.post('/timesheets/:id/approve', async (req, res, next) => {
   try {
     const { id } = req.params;
     const { rows: tsRows } = await pool.query(
-      `SELECT t.*, u.email, u.name
-       FROM timesheets t JOIN users u ON u.id = t.user_id
-       WHERE t.id = $1`,
+      `SELECT t.*, u.email, u.name FROM timesheets t JOIN users u ON u.id = t.user_id WHERE t.id = $1`,
       [id]
     );
     const ts = tsRows[0];
@@ -88,14 +148,11 @@ router.post('/timesheets/:id/approve', async (req, res, next) => {
     }
 
     await pool.query(
-      `UPDATE timesheets
-       SET status = 'approved', reviewed_at = NOW(), updated_at = NOW()
-       WHERE id = $1`,
+      `UPDATE timesheets SET status = 'approved', reviewed_at = NOW(), updated_at = NOW() WHERE id = $1`,
       [id]
     );
-
-    sendApprovalEmail(ts.email, { employeeName: ts.name, weekStart: ts.week_start_date })
-      .catch(console.error);
+    await createAuditLog({ timesheetId: id, action: 'approved', performedBy: req.user.id });
+    sendApprovalEmail(ts.email, { employeeName: ts.name, weekStart: ts.week_start_date }).catch(console.error);
 
     const { rows } = await pool.query('SELECT * FROM timesheets WHERE id = $1', [id]);
     res.json(rows[0]);
@@ -104,16 +161,14 @@ router.post('/timesheets/:id/approve', async (req, res, next) => {
   }
 });
 
-// POST /api/admin/timesheets/:id/reject
+// ─── POST /api/admin/timesheets/:id/reject ──────────────────────────────────
 router.post('/timesheets/:id/reject', async (req, res, next) => {
   try {
     const { id } = req.params;
     const { note } = req.body;
 
     const { rows: tsRows } = await pool.query(
-      `SELECT t.*, u.email, u.name
-       FROM timesheets t JOIN users u ON u.id = t.user_id
-       WHERE t.id = $1`,
+      `SELECT t.*, u.email, u.name FROM timesheets t JOIN users u ON u.id = t.user_id WHERE t.id = $1`,
       [id]
     );
     const ts = tsRows[0];
@@ -123,14 +178,11 @@ router.post('/timesheets/:id/reject', async (req, res, next) => {
     }
 
     await pool.query(
-      `UPDATE timesheets
-       SET status = 'rejected', admin_note = $1, reviewed_at = NOW(), updated_at = NOW()
-       WHERE id = $2`,
+      `UPDATE timesheets SET status = 'rejected', admin_note = $1, reviewed_at = NOW(), updated_at = NOW() WHERE id = $2`,
       [note || null, id]
     );
-
-    sendRejectionEmail(ts.email, { employeeName: ts.name, weekStart: ts.week_start_date, note })
-      .catch(console.error);
+    await createAuditLog({ timesheetId: id, action: 'rejected', performedBy: req.user.id, note });
+    sendRejectionEmail(ts.email, { employeeName: ts.name, weekStart: ts.week_start_date, note }).catch(console.error);
 
     const { rows } = await pool.query('SELECT * FROM timesheets WHERE id = $1', [id]);
     res.json(rows[0]);
@@ -139,12 +191,111 @@ router.post('/timesheets/:id/reject', async (req, res, next) => {
   }
 });
 
-// GET /api/admin/employees
+// ─── PUT /api/admin/timesheets/:id/amend-and-approve ────────────────────────
+router.put('/timesheets/:id/amend-and-approve', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { entries: submittedEntries } = req.body;
+
+    if (!Array.isArray(submittedEntries)) {
+      return res.status(400).json({ error: 'entries must be an array' });
+    }
+
+    const { rows: tsRows } = await pool.query(
+      `SELECT t.*, u.email, u.name FROM timesheets t JOIN users u ON u.id = t.user_id WHERE t.id = $1`,
+      [id]
+    );
+    const ts = tsRows[0];
+    if (!ts) return res.status(404).json({ error: 'Timesheet not found' });
+    if (ts.status !== 'submitted') {
+      return res.status(400).json({ error: 'Only submitted timesheets can be amended' });
+    }
+
+    const { rows: currentEntries } = await pool.query(
+      'SELECT * FROM timesheet_entries WHERE timesheet_id = $1',
+      [id]
+    );
+
+    const changes = {};
+    for (const entry of submittedEntries) {
+      const { day_of_week, hours } = entry;
+      if (!DAYS.includes(day_of_week)) continue;
+      const newHours = Math.min(24, Math.max(0, Math.round((parseFloat(hours) || 0) * 2) / 2));
+      const existing = currentEntries.find((e) => e.day_of_week === day_of_week);
+      const originalHours = parseFloat(existing?.hours || 0);
+
+      if (Math.abs(newHours - originalHours) >= 0.05) {
+        changes[day_of_week] = { before: originalHours, after: newHours };
+        await pool.query(
+          `INSERT INTO timesheet_entries (timesheet_id, day_of_week, hours, amended_hours)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (timesheet_id, day_of_week) DO UPDATE SET amended_hours = $4`,
+          [id, day_of_week, existing?.hours ?? 0, newHours]
+        );
+      }
+    }
+
+    await pool.query(
+      `UPDATE timesheets SET status = 'approved', reviewed_at = NOW(), updated_at = NOW() WHERE id = $1`,
+      [id]
+    );
+
+    const hasChanges = Object.keys(changes).length > 0;
+    await createAuditLog({
+      timesheetId: id,
+      action: hasChanges ? 'amended_and_approved' : 'approved',
+      performedBy: req.user.id,
+      changesJson: hasChanges ? changes : null,
+    });
+
+    if (hasChanges) {
+      sendAmendmentEmail(ts.email, { employeeName: ts.name, weekStart: ts.week_start_date, changes }).catch(console.error);
+    } else {
+      sendApprovalEmail(ts.email, { employeeName: ts.name, weekStart: ts.week_start_date }).catch(console.error);
+    }
+
+    const { rows } = await pool.query('SELECT * FROM timesheets WHERE id = $1', [id]);
+    res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── GET /api/admin/employees/overview ──────────────────────────────────────
+router.get('/employees/overview', async (req, res, next) => {
+  try {
+    const weekStart = getMondayOfCurrentWeek();
+
+    const { rows } = await pool.query(
+      `SELECT
+         u.id, u.name, u.department,
+         t.id         AS timesheet_id,
+         t.status,
+         t.total_hours,
+         t.is_overtime_flagged,
+         COALESCE(
+           (SELECT SUM(hours) FROM timesheet_entries WHERE timesheet_id = t.id), 0
+         ) AS computed_hours
+       FROM users u
+       LEFT JOIN timesheets t
+         ON t.user_id = u.id AND t.week_start_date = $1
+       WHERE u.role = 'employee'
+       ORDER BY u.name`,
+      [weekStart]
+    );
+    res.json({ weekStart, employees: rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── GET /api/admin/employees ───────────────────────────────────────────────
 router.get('/employees', async (req, res, next) => {
   try {
     const { rows } = await pool.query(
       `SELECT
          u.id, u.name, u.email, u.role, u.department, u.created_at,
+         u.overtime_threshold_hours,
          COUNT(t.id)                                              AS total_timesheets,
          COUNT(t.id) FILTER (WHERE t.status = 'submitted')       AS pending,
          COUNT(t.id) FILTER (WHERE t.status = 'approved')        AS approved,
@@ -161,7 +312,259 @@ router.get('/employees', async (req, res, next) => {
   }
 });
 
-// POST /api/admin/users — create a new user
+// ─── POST /api/admin/employees/:id/remind ───────────────────────────────────
+router.post('/employees/:id/remind', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const weekStart = getMondayOfCurrentWeek();
+
+    const { rows: userRows } = await pool.query(
+      'SELECT id, name, email, role FROM users WHERE id = $1',
+      [id]
+    );
+    const user = userRows[0];
+    if (!user) return res.status(404).json({ error: 'Employee not found' });
+    if (user.role !== 'employee') return res.status(400).json({ error: 'User is not an employee' });
+
+    const { rows: existing } = await pool.query(
+      `SELECT id FROM timesheets WHERE user_id = $1 AND week_start_date = $2 AND status IN ('submitted','approved')`,
+      [id, weekStart]
+    );
+    if (existing.length > 0) {
+      return res.status(400).json({ error: 'Employee has already submitted a timesheet this week' });
+    }
+
+    await sendReminderEmail(user.email, { employeeName: user.name, weekStart });
+    await createAuditLog({
+      timesheetId: null,
+      action: 'reminder_sent',
+      performedBy: req.user.id,
+      note: `Reminder sent to ${user.name} for week ${weekStart}`,
+    });
+
+    res.json({ message: `Reminder sent to ${user.name}` });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── POST /api/admin/reminders/remind-all ───────────────────────────────────
+router.post('/reminders/remind-all', async (req, res, next) => {
+  try {
+    const weekStart = getMondayOfCurrentWeek();
+
+    const { rows: employees } = await pool.query(
+      `SELECT u.id, u.name, u.email
+       FROM users u
+       WHERE u.role = 'employee'
+         AND NOT EXISTS (
+           SELECT 1 FROM timesheets t
+           WHERE t.user_id = u.id AND t.week_start_date = $1 AND t.status IN ('submitted','approved')
+         )
+       ORDER BY u.name`,
+      [weekStart]
+    );
+
+    const { rows: alreadySubmitted } = await pool.query(
+      `SELECT u.name
+       FROM users u
+       JOIN timesheets t ON t.user_id = u.id
+       WHERE u.role = 'employee' AND t.week_start_date = $1 AND t.status IN ('submitted','approved')
+       ORDER BY u.name`,
+      [weekStart]
+    );
+
+    const reminded = [];
+    for (const emp of employees) {
+      try {
+        await sendReminderEmail(emp.email, { employeeName: emp.name, weekStart });
+        await createAuditLog({
+          timesheetId: null,
+          action: 'reminder_sent',
+          performedBy: req.user.id,
+          note: `Reminder sent to ${emp.name} for week ${weekStart}`,
+        });
+        reminded.push(emp.name);
+      } catch (err) {
+        console.error(`Reminder failed for ${emp.email}:`, err.message);
+      }
+    }
+
+    res.json({
+      reminded,
+      skipped: alreadySubmitted.map((e) => e.name),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── GET /api/admin/reports/department-totals ───────────────────────────────
+router.get('/reports/department-totals', async (req, res, next) => {
+  try {
+    const weekStart = req.query.weekStart || getMondayOfCurrentWeek();
+
+    const { rows } = await pool.query(
+      `SELECT
+         COALESCE(u.department, 'Unassigned')                     AS department,
+         COUNT(DISTINCT u.id)::int                                AS employees,
+         COALESCE(SUM(eh.total), 0)                              AS total_approved_hours,
+         ROUND(
+           CASE WHEN COUNT(DISTINCT u.id) > 0
+             THEN COALESCE(SUM(eh.total), 0) / COUNT(DISTINCT u.id)::numeric
+             ELSE 0 END, 1
+         )                                                        AS avg_hours_per_employee,
+         COUNT(t.id) FILTER (WHERE t.is_overtime_flagged)::int   AS overtime_count
+       FROM users u
+       LEFT JOIN timesheets t
+         ON t.user_id = u.id AND t.status = 'approved' AND t.week_start_date = $1::DATE
+       LEFT JOIN (
+         SELECT timesheet_id, SUM(hours) AS total FROM timesheet_entries GROUP BY timesheet_id
+       ) eh ON eh.timesheet_id = t.id
+       WHERE u.role = 'employee'
+       GROUP BY u.department
+       ORDER BY department`,
+      [weekStart]
+    );
+    res.json({ weekStart, departments: rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── GET /api/admin/reports/overtime ────────────────────────────────────────
+router.get('/reports/overtime', async (req, res, next) => {
+  try {
+    const { employeeId, department, from, to } = req.query;
+    const params = [];
+    const conditions = ['t.is_overtime_flagged = true'];
+
+    if (employeeId) { params.push(employeeId); conditions.push(`u.id = $${params.length}`); }
+    if (department) { params.push(department); conditions.push(`u.department = $${params.length}`); }
+    if (from) { params.push(from); conditions.push(`t.week_start_date >= $${params.length}::DATE`); }
+    if (to) { params.push(to); conditions.push(`t.week_start_date <= $${params.length}::DATE`); }
+
+    const { rows } = await pool.query(
+      `SELECT
+         u.id AS employee_id,
+         u.name AS employee_name,
+         COALESCE(u.department, 'Unassigned') AS department,
+         t.week_start_date,
+         COALESCE(
+           (SELECT SUM(hours) FROM timesheet_entries WHERE timesheet_id = t.id), 0
+         ) AS total_hours,
+         u.overtime_threshold_hours AS threshold,
+         COALESCE(
+           (SELECT SUM(hours) FROM timesheet_entries WHERE timesheet_id = t.id), 0
+         ) - u.overtime_threshold_hours AS overtime_hours,
+         t.status
+       FROM timesheets t
+       JOIN users u ON u.id = t.user_id
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY t.week_start_date DESC, u.name`,
+      params
+    );
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── GET /api/admin/reports/export-csv ──────────────────────────────────────
+router.get('/reports/export-csv', async (req, res, next) => {
+  try {
+    const { employeeIds, departments, from, to, status } = req.query;
+    const params = [];
+    const conditions = [];
+
+    const empIds = employeeIds ? (Array.isArray(employeeIds) ? employeeIds : [employeeIds]) : [];
+    const depts = departments ? (Array.isArray(departments) ? departments : [departments]) : [];
+
+    if (empIds.length) {
+      params.push(empIds.map(Number));
+      conditions.push(`u.id = ANY($${params.length})`);
+    }
+    if (depts.length) {
+      params.push(depts);
+      conditions.push(`u.department = ANY($${params.length})`);
+    }
+    if (from) { params.push(from); conditions.push(`t.week_start_date >= $${params.length}::DATE`); }
+    if (to) { params.push(to); conditions.push(`t.week_start_date <= $${params.length}::DATE`); }
+    if (status) { params.push(status); conditions.push(`t.status = $${params.length}`); }
+
+    const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
+
+    const { rows } = await pool.query(
+      `SELECT
+         u.name AS employee_name,
+         COALESCE(u.department, '') AS department,
+         t.week_start_date,
+         MAX(CASE WHEN te.day_of_week = 'mon' THEN COALESCE(te.amended_hours, te.hours, 0) END) AS mon,
+         MAX(CASE WHEN te.day_of_week = 'tue' THEN COALESCE(te.amended_hours, te.hours, 0) END) AS tue,
+         MAX(CASE WHEN te.day_of_week = 'wed' THEN COALESCE(te.amended_hours, te.hours, 0) END) AS wed,
+         MAX(CASE WHEN te.day_of_week = 'thu' THEN COALESCE(te.amended_hours, te.hours, 0) END) AS thu,
+         MAX(CASE WHEN te.day_of_week = 'fri' THEN COALESCE(te.amended_hours, te.hours, 0) END) AS fri,
+         MAX(CASE WHEN te.day_of_week = 'sat' THEN COALESCE(te.amended_hours, te.hours, 0) END) AS sat,
+         MAX(CASE WHEN te.day_of_week = 'sun' THEN COALESCE(te.amended_hours, te.hours, 0) END) AS sun,
+         COALESCE(SUM(COALESCE(te.amended_hours, te.hours, 0)), 0) AS total_hours,
+         t.is_overtime_flagged,
+         t.status,
+         t.submitted_at,
+         t.reviewed_at,
+         t.admin_note
+       FROM timesheets t
+       JOIN users u ON u.id = t.user_id
+       LEFT JOIN timesheet_entries te ON te.timesheet_id = t.id
+       ${where}
+       GROUP BY t.id, u.name, u.department
+       ORDER BY t.week_start_date DESC, u.name`,
+      params
+    );
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="timesheets.csv"');
+
+    res.write('Employee Name,Department,Week Start,Mon,Tue,Wed,Thu,Fri,Sat,Sun,Total Hours,Overtime Flagged,Status,Submitted At,Approved At,Admin Note\r\n');
+
+    for (const row of rows) {
+      const cells = [
+        csvEscape(row.employee_name),
+        csvEscape(row.department),
+        row.week_start_date,
+        row.mon ?? 0,
+        row.tue ?? 0,
+        row.wed ?? 0,
+        row.thu ?? 0,
+        row.fri ?? 0,
+        row.sat ?? 0,
+        row.sun ?? 0,
+        parseFloat(row.total_hours || 0).toFixed(1),
+        row.is_overtime_flagged ? 'Yes' : 'No',
+        row.status,
+        row.submitted_at ? new Date(row.submitted_at).toISOString() : '',
+        row.reviewed_at ? new Date(row.reviewed_at).toISOString() : '',
+        csvEscape(row.admin_note || ''),
+      ];
+      res.write(cells.join(',') + '\r\n');
+    }
+
+    res.end();
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── POST /api/admin/reports/weekly-summary-email ───────────────────────────
+router.post('/reports/weekly-summary-email', async (req, res, next) => {
+  try {
+    await runWeeklySummary();
+    res.json({ message: 'Weekly summary email sent' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── POST /api/admin/users ──────────────────────────────────────────────────
 router.post('/users', async (req, res, next) => {
   try {
     const { name, email, password, role, department } = req.body;
@@ -195,7 +598,7 @@ router.post('/users', async (req, res, next) => {
   }
 });
 
-// PUT /api/admin/users/:id — update name and/or password
+// ─── PUT /api/admin/users/:id ───────────────────────────────────────────────
 router.put('/users/:id', async (req, res, next) => {
   try {
     const { id } = req.params;
