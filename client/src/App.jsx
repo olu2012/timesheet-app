@@ -12,6 +12,8 @@ import EmployeeOverview from './pages/admin/EmployeeOverview';
 import DepartmentTotals from './pages/admin/DepartmentTotals';
 import OvertimeReport from './pages/admin/OvertimeReport';
 import ExportCSV from './pages/admin/ExportCSV';
+import ManageShifts from './pages/admin/ManageShifts';
+import EmployeeShifts from './pages/employee/Shifts';
 
 function RoleRedirect() {
   const { user } = useAuth();
@@ -30,6 +32,7 @@ function AppRoutes() {
         <Route element={<Layout />}>
           <Route path="/timesheet" element={<Timesheet />} />
           <Route path="/history" element={<History />} />
+          <Route path="/shifts" element={<EmployeeShifts />} />
         </Route>
       </Route>
 
@@ -43,6 +46,7 @@ function AppRoutes() {
           <Route path="/admin/reports/department-totals" element={<DepartmentTotals />} />
           <Route path="/admin/reports/overtime" element={<OvertimeReport />} />
           <Route path="/admin/reports/export" element={<ExportCSV />} />
+          <Route path="/admin/shifts" element={<ManageShifts />} />
         </Route>
       </Route>
 

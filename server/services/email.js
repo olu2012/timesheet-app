@@ -178,6 +178,82 @@ async function sendWeeklySummaryEmail(to, { weekStart, stats, departmentBreakdow
   });
 }
 
+async function sendShiftClaimNotification(to, { employeeName, shiftTitle, date, startTime, endTime, location }) {
+  await resend.emails.send({
+    from: FROM, to,
+    subject: `[${COMPANY}] Shift claim — ${employeeName}`,
+    html: `<div style="font-family:sans-serif;max-width:480px;margin:auto">
+      ${header()}
+      <div style="border:1px solid #e5e7eb;border-top:none;padding:24px;border-radius:0 0 8px 8px">
+        <h2 style="color:#4f46e5;margin-top:0">New Shift Claim</h2>
+        <p><strong>${employeeName}</strong> has claimed a shift and is awaiting approval.</p>
+        <table style="border-collapse:collapse;width:100%;margin-top:12px">
+          <tr><td style="padding:6px 0;color:#6b7280">Shift</td><td><strong>${shiftTitle}</strong></td></tr>
+          <tr><td style="padding:6px 0;color:#6b7280">Date</td><td><strong>${date}</strong></td></tr>
+          <tr><td style="padding:6px 0;color:#6b7280">Time</td><td><strong>${startTime} – ${endTime}</strong></td></tr>
+          ${location ? `<tr><td style="padding:6px 0;color:#6b7280">Location</td><td><strong>${location}</strong></td></tr>` : ''}
+        </table>
+        <p style="margin-top:16px">Please log in to approve or reject this claim.</p>
+        ${footer()}
+      </div></div>`,
+  });
+}
+
+async function sendShiftApprovedEmail(to, { employeeName, shiftTitle, date, startTime, endTime, location }) {
+  await resend.emails.send({
+    from: FROM, to,
+    subject: `[${COMPANY}] Shift confirmed — ${shiftTitle}`,
+    html: `<div style="font-family:sans-serif;max-width:480px;margin:auto">
+      ${header()}
+      <div style="border:1px solid #e5e7eb;border-top:none;padding:24px;border-radius:0 0 8px 8px">
+        <h2 style="color:#16a34a;margin-top:0">Shift Approved</h2>
+        <p>Hi <strong>${employeeName}</strong>, your shift has been confirmed!</p>
+        <table style="border-collapse:collapse;width:100%;margin-top:12px">
+          <tr><td style="padding:6px 0;color:#6b7280">Shift</td><td><strong>${shiftTitle}</strong></td></tr>
+          <tr><td style="padding:6px 0;color:#6b7280">Date</td><td><strong>${date}</strong></td></tr>
+          <tr><td style="padding:6px 0;color:#6b7280">Time</td><td><strong>${startTime} – ${endTime}</strong></td></tr>
+          ${location ? `<tr><td style="padding:6px 0;color:#6b7280">Location</td><td><strong>${location}</strong></td></tr>` : ''}
+        </table>
+        ${footer()}
+      </div></div>`,
+  });
+}
+
+async function sendShiftRejectedEmail(to, { employeeName, shiftTitle, date }) {
+  await resend.emails.send({
+    from: FROM, to,
+    subject: `[${COMPANY}] Shift claim not approved — ${shiftTitle}`,
+    html: `<div style="font-family:sans-serif;max-width:480px;margin:auto">
+      ${header()}
+      <div style="border:1px solid #e5e7eb;border-top:none;padding:24px;border-radius:0 0 8px 8px">
+        <h2 style="color:#dc2626;margin-top:0">Shift Claim Rejected</h2>
+        <p>Hi <strong>${employeeName}</strong>, unfortunately your claim for <strong>${shiftTitle}</strong> on <strong>${date}</strong> was not approved.</p>
+        <p>Please check the shifts page for other available shifts.</p>
+        ${footer()}
+      </div></div>`,
+  });
+}
+
+async function sendShiftAssignedEmail(to, { employeeName, shiftTitle, date, startTime, endTime, location }) {
+  await resend.emails.send({
+    from: FROM, to,
+    subject: `[${COMPANY}] You have been assigned a shift — ${shiftTitle}`,
+    html: `<div style="font-family:sans-serif;max-width:480px;margin:auto">
+      ${header()}
+      <div style="border:1px solid #e5e7eb;border-top:none;padding:24px;border-radius:0 0 8px 8px">
+        <h2 style="color:#4f46e5;margin-top:0">Shift Assigned</h2>
+        <p>Hi <strong>${employeeName}</strong>, you have been assigned to the following shift:</p>
+        <table style="border-collapse:collapse;width:100%;margin-top:12px">
+          <tr><td style="padding:6px 0;color:#6b7280">Shift</td><td><strong>${shiftTitle}</strong></td></tr>
+          <tr><td style="padding:6px 0;color:#6b7280">Date</td><td><strong>${date}</strong></td></tr>
+          <tr><td style="padding:6px 0;color:#6b7280">Time</td><td><strong>${startTime} – ${endTime}</strong></td></tr>
+          ${location ? `<tr><td style="padding:6px 0;color:#6b7280">Location</td><td><strong>${location}</strong></td></tr>` : ''}
+        </table>
+        ${footer()}
+      </div></div>`,
+  });
+}
+
 module.exports = {
   sendApprovalEmail,
   sendRejectionEmail,
@@ -185,4 +261,8 @@ module.exports = {
   sendReminderEmail,
   sendAmendmentEmail,
   sendWeeklySummaryEmail,
+  sendShiftClaimNotification,
+  sendShiftApprovedEmail,
+  sendShiftRejectedEmail,
+  sendShiftAssignedEmail,
 };

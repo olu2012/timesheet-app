@@ -4,6 +4,7 @@ const cors = require('cors');
 const authRoutes = require('./routes/auth');
 const timesheetRoutes = require('./routes/timesheets');
 const adminRoutes = require('./routes/admin');
+const shiftRoutes = require('./routes/shifts');
 const errorHandler = require('./middleware/errorHandler');
 const { startCronJobs } = require('./services/cron');
 const pool = require('./db/pool');
@@ -23,6 +24,27 @@ async function runMigrations() {
         note            TEXT,
         changes_json    JSONB,
         created_at      TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS shifts (
+        id          SERIAL PRIMARY KEY,
+        title       VARCHAR(255) NOT NULL,
+        date        DATE NOT NULL,
+        start_time  TIME NOT NULL,
+        end_time    TIME NOT NULL,
+        location    VARCHAR(255),
+        max_staff   INTEGER DEFAULT 1,
+        created_by  INTEGER REFERENCES users(id),
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS shift_assignments (
+        id          SERIAL PRIMARY KEY,
+        shift_id    INTEGER REFERENCES shifts(id) ON DELETE CASCADE,
+        user_id     INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        status      VARCHAR(20) DEFAULT 'pending'
+                      CHECK (status IN ('pending','approved','rejected')),
+        assigned_by INTEGER REFERENCES users(id),
+        created_at  TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE (shift_id, user_id)
       );
     `);
     console.log('Migrations applied.');
@@ -51,6 +73,7 @@ app.use(express.json());
 app.use('/api/auth', authRoutes);
 app.use('/api/timesheets', timesheetRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/shifts', shiftRoutes);
 
 app.use(errorHandler);
 

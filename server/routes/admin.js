@@ -2,7 +2,10 @@ const express = require('express');
 const bcrypt = require('bcrypt');
 const pool = require('../db/pool');
 const { authenticate, requireAdmin } = require('../middleware/auth');
-const { sendApprovalEmail, sendRejectionEmail, sendReminderEmail, sendAmendmentEmail } = require('../services/email');
+const {
+  sendApprovalEmail, sendRejectionEmail, sendReminderEmail, sendAmendmentEmail,
+  sendShiftApprovedEmail, sendShiftRejectedEmail, sendShiftAssignedEmail,
+} = require('../services/email');
 const { getMondayOfCurrentWeek, createAuditLog } = require('../db/helpers');
 const { runRemindAll, runWeeklySummary } = require('../services/cron');
 
@@ -628,6 +631,232 @@ router.put('/users/:id', async (req, res, next) => {
     );
 
     res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── Shift helpers ────────────────────────────────────────────────────────────
+function addDays(dateStr, days) {
+  const d = new Date(dateStr + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().split('T')[0];
+}
+
+const SHIFT_SELECT = `
+  SELECT
+    s.*,
+    s.date::text AS date,
+    creator.name AS created_by_name,
+    COUNT(sa.id) FILTER (WHERE sa.status = 'approved')::int AS approved_count,
+    COUNT(sa.id) FILTER (WHERE sa.status = 'pending')::int  AS pending_count,
+    COALESCE(
+      json_agg(
+        json_build_object(
+          'id', sa.id,
+          'user_id', sa.user_id,
+          'user_name', assignee.name,
+          'status', sa.status,
+          'assigned_by', sa.assigned_by
+        ) ORDER BY sa.created_at
+      ) FILTER (WHERE sa.id IS NOT NULL),
+      '[]'::json
+    ) AS assignments
+  FROM shifts s
+  LEFT JOIN users creator ON creator.id = s.created_by
+  LEFT JOIN shift_assignments sa ON sa.shift_id = s.id
+  LEFT JOIN users assignee ON assignee.id = sa.user_id`;
+
+// ─── GET /api/admin/shifts ───────────────────────────────────────────────────
+router.get('/shifts', async (req, res, next) => {
+  try {
+    const monday = req.query.weekStart || getMondayOfCurrentWeek();
+    const sunday = addDays(monday, 6);
+    const { rows } = await pool.query(
+      `${SHIFT_SELECT}
+       WHERE s.date BETWEEN $1::DATE AND $2::DATE
+       GROUP BY s.id, creator.name
+       ORDER BY s.date, s.start_time`,
+      [monday, sunday]
+    );
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── POST /api/admin/shifts ──────────────────────────────────────────────────
+router.post('/shifts', async (req, res, next) => {
+  try {
+    const { title, date, start_time, end_time, location, max_staff } = req.body;
+    if (!title || !date || !start_time || !end_time) {
+      return res.status(400).json({ error: 'Title, date, start time and end time are required' });
+    }
+    if (end_time <= start_time) {
+      return res.status(400).json({ error: 'End time must be after start time' });
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO shifts (title, date, start_time, end_time, location, max_staff, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING *, date::text AS date`,
+      [title.trim(), date, start_time, end_time, location?.trim() || null, max_staff || 1, req.user.id]
+    );
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── PUT /api/admin/shifts/:id ───────────────────────────────────────────────
+router.put('/shifts/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { title, date, start_time, end_time, location, max_staff } = req.body;
+    if (!title || !date || !start_time || !end_time) {
+      return res.status(400).json({ error: 'Title, date, start time and end time are required' });
+    }
+    if (end_time <= start_time) {
+      return res.status(400).json({ error: 'End time must be after start time' });
+    }
+    const { rows } = await pool.query(
+      `UPDATE shifts SET title=$1, date=$2, start_time=$3, end_time=$4, location=$5, max_staff=$6
+       WHERE id=$7 RETURNING *, date::text AS date`,
+      [title.trim(), date, start_time, end_time, location?.trim() || null, max_staff || 1, id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Shift not found' });
+    res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── DELETE /api/admin/shifts/:id ────────────────────────────────────────────
+router.delete('/shifts/:id', async (req, res, next) => {
+  try {
+    const { rows } = await pool.query('DELETE FROM shifts WHERE id=$1 RETURNING id', [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Shift not found' });
+    res.json({ message: 'Shift deleted' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── POST /api/admin/shifts/:id/assignments/:userId/approve ──────────────────
+router.post('/shifts/:id/assignments/:userId/approve', async (req, res, next) => {
+  try {
+    const { id, userId } = req.params;
+
+    const { rows: shiftRows } = await pool.query('SELECT * FROM shifts WHERE id=$1', [id]);
+    const shift = shiftRows[0];
+    if (!shift) return res.status(404).json({ error: 'Shift not found' });
+
+    const { rows: countRows } = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM shift_assignments WHERE shift_id=$1 AND status='approved' AND user_id != $2`,
+      [id, userId]
+    );
+    if (countRows[0].count >= shift.max_staff) {
+      return res.status(400).json({ error: 'Shift is already at maximum staff capacity' });
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE shift_assignments SET status='approved' WHERE shift_id=$1 AND user_id=$2 RETURNING *`,
+      [id, userId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Assignment not found' });
+
+    const { rows: userRows } = await pool.query('SELECT name, email FROM users WHERE id=$1', [userId]);
+    const user = userRows[0];
+    if (user) {
+      sendShiftApprovedEmail(user.email, {
+        employeeName: user.name,
+        shiftTitle: shift.title,
+        date: shift.date,
+        startTime: shift.start_time,
+        endTime: shift.end_time,
+        location: shift.location,
+      }).catch(console.error);
+    }
+
+    res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── POST /api/admin/shifts/:id/assignments/:userId/reject ───────────────────
+router.post('/shifts/:id/assignments/:userId/reject', async (req, res, next) => {
+  try {
+    const { id, userId } = req.params;
+
+    const { rows: shiftRows } = await pool.query('SELECT * FROM shifts WHERE id=$1', [id]);
+    const shift = shiftRows[0];
+    if (!shift) return res.status(404).json({ error: 'Shift not found' });
+
+    const { rows } = await pool.query(
+      `UPDATE shift_assignments SET status='rejected' WHERE shift_id=$1 AND user_id=$2 RETURNING *`,
+      [id, userId]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Assignment not found' });
+
+    const { rows: userRows } = await pool.query('SELECT name, email FROM users WHERE id=$1', [userId]);
+    const user = userRows[0];
+    if (user) {
+      sendShiftRejectedEmail(user.email, {
+        employeeName: user.name,
+        shiftTitle: shift.title,
+        date: shift.date,
+      }).catch(console.error);
+    }
+
+    res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── POST /api/admin/shifts/:id/assign ──────────────────────────────────────
+router.post('/shifts/:id/assign', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+    const { rows: shiftRows } = await pool.query('SELECT * FROM shifts WHERE id=$1', [id]);
+    const shift = shiftRows[0];
+    if (!shift) return res.status(404).json({ error: 'Shift not found' });
+
+    const { rows: userRows } = await pool.query(
+      `SELECT id, name, email, role FROM users WHERE id=$1`, [userId]
+    );
+    const user = userRows[0];
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (user.role !== 'employee') return res.status(400).json({ error: 'Can only assign employees' });
+
+    const { rows: countRows } = await pool.query(
+      `SELECT COUNT(*)::int AS count FROM shift_assignments WHERE shift_id=$1 AND status='approved' AND user_id != $2`,
+      [id, userId]
+    );
+    if (countRows[0].count >= shift.max_staff) {
+      return res.status(400).json({ error: 'Shift is already at maximum staff capacity' });
+    }
+
+    await pool.query(
+      `INSERT INTO shift_assignments (shift_id, user_id, status, assigned_by)
+       VALUES ($1, $2, 'approved', $3)
+       ON CONFLICT (shift_id, user_id) DO UPDATE SET status='approved', assigned_by=$3`,
+      [id, userId, req.user.id]
+    );
+
+    sendShiftAssignedEmail(user.email, {
+      employeeName: user.name,
+      shiftTitle: shift.title,
+      date: shift.date,
+      startTime: shift.start_time,
+      endTime: shift.end_time,
+      location: shift.location,
+    }).catch(console.error);
+
+    res.json({ message: `${user.name} assigned to shift` });
   } catch (err) {
     next(err);
   }

@@ -93,6 +93,7 @@ export default function Navbar() {
             <>
               <NavItem to="/timesheet">My Timesheet</NavItem>
               <NavItem to="/history">History</NavItem>
+              <NavItem to="/shifts">Shifts</NavItem>
             </>
           )}
 
@@ -104,6 +105,12 @@ export default function Navbar() {
                   { to: '/admin', label: 'Dashboard' },
                   { to: '/admin/timesheets', label: 'All Timesheets' },
                   { to: '/admin/employees/overview', label: 'Employee Overview' },
+                ]}
+              />
+              <NavDropdown
+                label="Shifts"
+                items={[
+                  { to: '/admin/shifts', label: 'Manage Shifts' },
                 ]}
               />
               <NavDropdown
