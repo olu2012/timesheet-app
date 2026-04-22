@@ -10,12 +10,12 @@ async function seed() {
     const schema = fs.readFileSync(require('path').join(__dirname, 'schema.sql'), 'utf8');
     await client.query(schema);
 
-    const adminHash = await bcrypt.hash('admin123', 10);
+    const adminHash = await bcrypt.hash('Rad1Pitere20@', 10);
     const empHash = await bcrypt.hash('employee123', 10);
 
     await client.query(`
       INSERT INTO users (name, email, password_hash, role, department) VALUES
-        ('Admin User', 'admin@company.com', $1, 'admin', 'Management')
+        ('Admin User', 'admin@rqsolimited.com', $1, 'admin', 'Management')
       ON CONFLICT (email) DO NOTHING
     `, [adminHash]);
 
@@ -34,7 +34,7 @@ async function seed() {
     }
 
     console.log('✓ Seed complete');
-    console.log('  Admin    : admin@company.com  / admin123');
+    console.log('  Admin    : admin@rqsolimited.com  / Rad1Pitere20@');
     console.log('  Employee : alice@company.com  / employee123');
     console.log('  Employee : bob@company.com    / employee123');
     console.log('  Employee : carol@company.com  / employee123');
